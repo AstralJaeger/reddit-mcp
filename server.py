@@ -4,6 +4,8 @@ import time
 from datetime import datetime
 from os import getenv
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, TypeVar, cast
+import sentry_sdk
+from sentry_sdk import capture_exception, capture_message, set_context, set_tag, set_user, start_transaction
 
 import praw  # type: ignore
 from mcp.server.fastmcp import FastMCP
@@ -15,6 +17,23 @@ if TYPE_CHECKING:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+sentry_sdk.init(
+    dsn="https://346b41b99e85d39b14bcaf49b58a91cf@o1319955.ingest.us.sentry.io/4509762106490880",
+    # Add data like request headers and IP for users,
+    # see https://docs.sentry.io/platforms/python/data-management/data-collected/ for more info
+    send_default_pii=True,
+    # Set traces_sample_rate to 1.0 to capture 100%
+    # of transactions for tracing.
+    traces_sample_rate=1.0,  # Capture 100% of transactions
+    # Performance monitoring
+    profiles_sample_rate=1.0,  # Profile 100% of sampled transactions
+    # Release tracking
+    release="reddit-mcp@1.0.0",
+    environment=getenv("SENTRY_ENVIRONMENT", "production"),
+    # Additional options
+    attach_stacktrace=True,
+    shutdown_timeout=5,
+)
 
 class RedditClientManager:
     """Manages the Reddit client and its state."""
@@ -134,8 +153,118 @@ def require_write_access(func: F) -> F:
     return cast(F, wrapper)
 
 
+def track_tool_usage(func: F) -> F:
+    """Decorator to track tool usage with Sentry."""
+    
+    @functools.wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        tool_name = func.__name__
+        
+        # Start a Sentry transaction for this tool call
+        with start_transaction(op="mcp.tool", name=tool_name) as transaction:
+            # Set basic tags
+            set_tag("tool.name", tool_name)
+            set_tag("tool.type", "read" if "write" not in str(func.__dict__.get("__wrapped__", func)) else "write")
+            
+            # Track tool parameters (sanitized)
+            params = {}
+            if args:
+                # Get parameter names from function signature
+                import inspect
+                sig = inspect.signature(func)
+                param_names = list(sig.parameters.keys())
+                for i, (param_name, value) in enumerate(zip(param_names, args)):
+                    if param_name in ["username", "subreddit", "submission_id", "post_id"]:
+                        params[param_name] = str(value)[:100]  # Truncate for privacy
+            params.update({k: str(v)[:100] for k, v in kwargs.items() if k in ["username", "subreddit", "submission_id", "post_id", "limit", "sort", "time_filter"]})
+            
+            set_context("tool_parameters", params)
+            
+            # Set user context if authenticated
+            try:
+                manager = RedditClientManager()
+                if manager.client and not manager.is_read_only:
+                    username = getenv("REDDIT_USERNAME", "anonymous")
+                    set_user({"username": username, "ip_address": "{{auto}}"})
+                else:
+                    set_user({"username": "anonymous_read_only", "ip_address": "{{auto}}"})
+            except Exception:
+                pass
+            
+            # Track execution
+            start_time = time.time()
+            error_occurred = False
+            error_type = None
+            
+            try:
+                result = func(*args, **kwargs)
+                
+                # Track result metadata
+                if isinstance(result, dict):
+                    metadata = result.get("metadata", {})
+                    if metadata:
+                        set_context("result_metadata", {
+                            "fetched_at": metadata.get("fetched_at"),
+                            "post_count": metadata.get("post_count"),
+                            "total_comments_fetched": metadata.get("total_comments_fetched"),
+                        })
+                
+                # Success metrics
+                execution_time = time.time() - start_time
+                transaction.set_tag("execution_time_ms", int(execution_time * 1000))
+                transaction.set_tag("success", True)
+                
+                # Log successful tool usage
+                capture_message(
+                    f"Tool {tool_name} executed successfully",
+                    level="info",
+                    extras={
+                        "execution_time": execution_time,
+                        "parameters": params,
+                    }
+                )
+                
+                return result
+                
+            except Exception as e:
+                error_occurred = True
+                error_type = type(e).__name__
+                
+                # Track the error
+                capture_exception(e)
+                
+                # Set error context
+                transaction.set_tag("success", False)
+                transaction.set_tag("error_type", error_type)
+                
+                # Re-raise the exception
+                raise
+                
+            finally:
+                # Track final metrics
+                execution_time = time.time() - start_time
+                transaction.set_measurement("execution_time", execution_time, "second")
+                
+                # Log tool execution summary
+                logger.info(
+                    f"Tool {tool_name} {'failed' if error_occurred else 'succeeded'} "
+                    f"in {execution_time:.2f}s"
+                    f"{f' with error: {error_type}' if error_occurred else ''}"
+                )
+    
+    return cast(F, wrapper)
+
+
 mcp = FastMCP("Reddit MCP")
 reddit_manager = RedditClientManager()
+
+# Initialize Sentry session context
+set_context("mcp_server", {
+    "version": "1.0.0",
+    "environment": getenv("SENTRY_ENVIRONMENT", "production"),
+    "reddit_client_initialized": reddit_manager.client is not None,
+    "reddit_mode": "read_only" if reddit_manager.is_read_only else "authenticated",
+})
 
 
 def _format_timestamp(timestamp: float) -> str:
@@ -304,6 +433,7 @@ def _analyze_comment_impact(score: int, is_edited: bool, is_op: bool) -> str:
     return "\n  - ".join(insights or ["Standard engagement with discussion"])
 
 
+@track_tool_usage
 @mcp.tool()
 def get_user_info(username: str) -> Dict[str, Any]:
     """Get information about a Reddit user.
@@ -387,6 +517,7 @@ def get_user_info(username: str) -> Dict[str, Any]:
         raise RuntimeError(f"Failed to get user info: {e}") from e
 
 
+@track_tool_usage
 @mcp.tool()
 def get_top_posts(
     subreddit: str, time_filter: str = "week", limit: int = 10
@@ -549,6 +680,7 @@ def get_top_posts(
         raise RuntimeError(f"Failed to get top posts: {e}") from e
 
 
+@track_tool_usage
 @mcp.tool()
 def get_subreddit_info(subreddit_name: str) -> Dict[str, Any]:
     """Get information about a subreddit.
@@ -607,6 +739,7 @@ def get_subreddit_info(subreddit_name: str) -> Dict[str, Any]:
         raise RuntimeError(f"Failed to get subreddit info: {e}") from e
 
 
+@track_tool_usage
 @mcp.tool()
 def get_trending_subreddits(limit: int = 5) -> "Dict[str, List[Dict[str, Any]]]":
     """Get currently trending subreddits.
@@ -659,6 +792,7 @@ def get_trending_subreddits(limit: int = 5) -> "Dict[str, List[Dict[str, Any]]]"
         raise RuntimeError(f"Failed to get trending subreddits: {e}") from e
 
 
+@track_tool_usage
 @mcp.tool()
 def get_subreddit_stats(subreddit: str) -> Dict[str, Any]:
     """Get statistics and information about a subreddit.
@@ -801,6 +935,7 @@ def get_subreddit_stats(subreddit: str) -> Dict[str, Any]:
         raise RuntimeError(f"Failed to get subreddit stats: {e}") from e
 
 
+@track_tool_usage
 @mcp.tool()
 @require_write_access
 def create_post(
@@ -930,6 +1065,7 @@ def create_post(
         raise RuntimeError(f"Failed to create post: {e}") from e
 
 
+@track_tool_usage
 @mcp.tool()
 @require_write_access
 def reply_to_post(
@@ -1045,6 +1181,7 @@ def reply_to_post(
         raise RuntimeError(f"Failed to create comment reply: {e}") from e
 
 
+@track_tool_usage
 @mcp.tool()
 def get_submission_by_url(url: str) -> Dict[str, Any]:
     """Get a Reddit submission by its URL.
@@ -1227,6 +1364,7 @@ def get_submission_by_url(url: str) -> Dict[str, Any]:
         raise RuntimeError(f"Failed to get submission by URL: {e}") from e
 
 
+@track_tool_usage
 @mcp.tool()
 def get_submission_by_id(submission_id: str) -> Dict[str, Any]:
     """Get a Reddit submission by its ID.
@@ -1413,6 +1551,502 @@ def get_submission_by_id(submission_id: str) -> Dict[str, Any]:
         raise RuntimeError(f"Failed to get submission by ID: {e}") from e
 
 
+@track_tool_usage
+@mcp.tool()
+def get_submission_comments(
+    submission_id: str,
+    limit: int = 50,
+    sort: str = "best",
+    include_replies: bool = True,
+    max_depth: int = 3,
+) -> Dict[str, Any]:
+    """Fetch comments from a Reddit submission in an LLM-friendly format.
+
+    Args:
+        submission_id: The ID of the submission (can be full URL or just ID)
+        limit: Maximum number of top-level comments to retrieve (1-500, default 50)
+        sort: Comment sorting method ('best', 'top', 'new', 'controversial', 'old', 'qa')
+        include_replies: Whether to include comment replies (default True)
+        max_depth: Maximum depth of comment replies to include (1-10, default 3)
+
+    Returns:
+        Dictionary containing structured comment data:
+        {
+            'submission': {
+                'id': str,
+                'title': str,
+                'author': str,
+                'score': int,
+                'num_comments': int,
+                'content': str,  # Text content or URL
+                'media': Optional[Dict],  # Media information if available
+            },
+            'comments': List[Dict],  # List of comment objects
+            'metadata': {
+                'total_comments_fetched': int,
+                'max_depth_reached': int,
+                'sort_method': str,
+                'fetched_at': float,
+                'more_comments_available': bool
+            }
+        }
+
+    Raises:
+        ValueError: If submission not found or invalid parameters
+        RuntimeError: For other errors during the operation
+    """
+    manager = RedditClientManager()
+    if not manager.client:
+        raise RuntimeError("Reddit client not initialized")
+
+    # Input validation
+    if not submission_id:
+        raise ValueError("Submission ID is required")
+
+    limit = max(1, min(500, limit))
+    max_depth = max(1, min(10, max_depth))
+    valid_sorts = ["best", "top", "new", "controversial", "old", "qa"]
+    if sort not in valid_sorts:
+        raise ValueError(f"Sort must be one of: {', '.join(valid_sorts)}")
+
+    try:
+        # Clean up the submission ID
+        clean_submission_id = _extract_reddit_id(submission_id)
+        logger.info(f"Fetching comments for submission: {clean_submission_id}")
+
+        # Get the submission
+        submission = manager.client.submission(id=clean_submission_id)
+
+        # Set comment sort order
+        submission.comment_sort = sort
+
+        # Replace MoreComments objects to get actual comments
+        submission.comments.replace_more(limit=limit)
+
+        # Helper function to format a comment recursively
+        def format_comment(comment, depth=0):
+            """Format a comment and its replies recursively."""
+            if depth > max_depth:
+                return None
+
+            if isinstance(comment, praw.models.MoreComments):
+                return None
+
+            # Safe attribute access
+            author = str(comment.author) if comment.author else "[deleted]"
+            body = getattr(comment, "body", "[removed]")
+
+            # Format the comment
+            formatted = {
+                "id": getattr(comment, "id", ""),
+                "author": author,
+                "body": body,
+                "score": getattr(comment, "score", 0),
+                "created_utc": getattr(comment, "created_utc", 0),
+                "edited": bool(getattr(comment, "edited", False)),
+                "is_submitter": getattr(comment, "is_submitter", False),
+                "distinguished": getattr(comment, "distinguished", None),
+                "stickied": getattr(comment, "stickied", False),
+                "gilded": getattr(comment, "gilded", 0),
+                "depth": depth,
+                "permalink": f"https://reddit.com{getattr(comment, 'permalink', '')}",
+            }
+
+            # Add replies if requested and available
+            if include_replies and hasattr(comment, "replies") and comment.replies:
+                formatted["replies"] = []
+                for reply in comment.replies:
+                    if isinstance(reply, praw.models.Comment):
+                        reply_formatted = format_comment(reply, depth + 1)
+                        if reply_formatted:
+                            formatted["replies"].append(reply_formatted)
+
+            return formatted
+
+        # Format all top-level comments
+        comments = []
+        comment_count = 0
+        max_depth_reached = 0
+
+        for comment in submission.comments[:limit]:
+            if isinstance(comment, praw.models.Comment):
+                formatted_comment = format_comment(comment)
+                if formatted_comment:
+                    comments.append(formatted_comment)
+                    comment_count += 1
+
+                    # Track max depth
+                    def get_max_depth(comment_dict, current_depth=0):
+                        max_d = current_depth
+                        if "replies" in comment_dict:
+                            for reply in comment_dict["replies"]:
+                                max_d = max(
+                                    max_d, get_max_depth(reply, current_depth + 1)
+                                )
+                        return max_d
+
+                    max_depth_reached = max(
+                        max_depth_reached, get_max_depth(formatted_comment)
+                    )
+
+        # Extract media information if available
+        media_info = None
+        if hasattr(submission, "is_video") and submission.is_video:
+            media_info = {
+                "type": "video",
+                "is_reddit_video": getattr(submission, "is_reddit_media_domain", False),
+                "media": getattr(submission, "media", {}),
+                "preview": getattr(submission, "preview", {}),
+            }
+        elif hasattr(submission, "preview") and submission.preview:
+            media_info = {
+                "type": "image",
+                "url": submission.url,
+                "preview": submission.preview,
+            }
+        elif not submission.is_self:
+            media_info = {
+                "type": "link",
+                "url": submission.url,
+                "domain": getattr(submission, "domain", ""),
+            }
+
+        # Build the response
+        result = {
+            "submission": {
+                "id": submission.id,
+                "title": submission.title,
+                "author": str(submission.author) if submission.author else "[deleted]",
+                "score": submission.score,
+                "num_comments": submission.num_comments,
+                "content": submission.selftext
+                if submission.is_self
+                else submission.url,
+                "is_self": submission.is_self,
+                "created_utc": submission.created_utc,
+                "upvote_ratio": submission.upvote_ratio,
+                "media": media_info,
+            },
+            "comments": comments,
+            "metadata": {
+                "total_comments_fetched": comment_count,
+                "max_depth_reached": max_depth_reached,
+                "sort_method": sort,
+                "fetched_at": time.time(),
+                "more_comments_available": len(submission.comments) > limit,
+                "include_replies": include_replies,
+                "requested_limit": limit,
+            },
+        }
+
+        return result
+
+    except Exception as e:
+        logger.error(f"Error in get_submission_comments: {e}")
+        if "404" in str(e) or "not found" in str(e).lower():
+            raise ValueError(f"Submission {submission_id} not found") from e
+        if "403" in str(e) or "forbidden" in str(e).lower():
+            raise ValueError(
+                f"Not authorized to access submission {submission_id}"
+            ) from e
+        if isinstance(e, (ValueError, RuntimeError)):
+            raise
+        raise RuntimeError(f"Failed to fetch comments: {e}") from e
+
+
+@track_tool_usage
+@mcp.tool()
+def get_submission_with_media(submission_id: str) -> Dict[str, Any]:
+    """Get a Reddit submission with enhanced media handling for LLM processing.
+
+    This tool provides detailed media information for image, video, gallery, and other
+    multimedia submissions in a format optimized for LLM understanding.
+
+    Args:
+        submission_id: The ID of the submission (can be full URL or just ID)
+
+    Returns:
+        Dictionary containing submission data with enhanced media information:
+        {
+            'id': str,
+            'title': str,
+            'author': str,
+            'subreddit': str,
+            'score': int,
+            'upvote_ratio': float,
+            'num_comments': int,
+            'created_utc': float,
+            'url': str,
+            'permalink': str,
+            'is_self': bool,
+            'content': str,  # Text content or description
+            'media_type': str,  # 'text', 'image', 'video', 'gallery', 'link', 'poll'
+            'media_details': {
+                # For images:
+                'images': List[{
+                    'url': str,
+                    'width': int,
+                    'height': int,
+                    'caption': Optional[str]
+                }],
+                # For videos:
+                'video': {
+                    'url': str,
+                    'duration': Optional[int],
+                    'width': int,
+                    'height': int,
+                    'has_audio': bool,
+                    'fallback_url': Optional[str]
+                },
+                # For galleries:
+                'gallery_items': List[{
+                    'media_id': str,
+                    'caption': Optional[str],
+                    'url': str,
+                    'type': str
+                }],
+                # For polls:
+                'poll': {
+                    'total_votes': int,
+                    'options': List[{
+                        'text': str,
+                        'votes': Optional[int]
+                    }],
+                    'voting_end_timestamp': float
+                },
+                # Common fields:
+                'thumbnail': Optional[str],
+                'preview_images': List[str],
+                'external_url': Optional[str]
+            },
+            'flair': Optional[Dict],
+            'awards': List[Dict],
+            'metadata': Dict
+        }
+
+    Raises:
+        ValueError: If submission not found or invalid ID
+        RuntimeError: For other errors during the operation
+    """
+    manager = RedditClientManager()
+    if not manager.client:
+        raise RuntimeError("Reddit client not initialized")
+
+    try:
+        # Clean up the submission ID
+        clean_submission_id = _extract_reddit_id(submission_id)
+        logger.info(f"Fetching submission with media: {clean_submission_id}")
+
+        # Get the submission
+        submission = manager.client.submission(id=clean_submission_id)
+
+        # Force load submission data
+        _ = submission.title
+
+        # Determine media type and extract details
+        media_type = "text"
+        media_details = {}
+
+        # Check for video content
+        if getattr(submission, "is_video", False):
+            media_type = "video"
+            media = getattr(submission, "media", {})
+            reddit_video = media.get("reddit_video", {}) if media else {}
+
+            media_details["video"] = {
+                "url": reddit_video.get("fallback_url", ""),
+                "duration": reddit_video.get("duration"),
+                "width": reddit_video.get("width", 0),
+                "height": reddit_video.get("height", 0),
+                "has_audio": reddit_video.get("has_audio", True),
+                "dash_url": reddit_video.get("dash_url"),
+                "hls_url": reddit_video.get("hls_url"),
+                "is_gif": reddit_video.get("is_gif", False),
+                "transcoding_status": reddit_video.get(
+                    "transcoding_status", "completed"
+                ),
+            }
+
+        # Check for gallery content
+        elif hasattr(submission, "is_gallery") and submission.is_gallery:
+            media_type = "gallery"
+            gallery_data = getattr(submission, "gallery_data", {})
+            media_metadata = getattr(submission, "media_metadata", {})
+
+            gallery_items = []
+            if gallery_data and media_metadata:
+                items = gallery_data.get("items", [])
+                for item in items:
+                    media_id = item.get("media_id", "")
+                    if media_id in media_metadata:
+                        metadata = media_metadata[media_id]
+                        status = metadata.get("status", "")
+                        if status == "valid":
+                            # Get the image URL
+                            source = metadata.get("s", {})
+                            gallery_items.append(
+                                {
+                                    "media_id": media_id,
+                                    "caption": item.get("caption", ""),
+                                    "url": source.get("u", "").replace("&amp;", "&"),
+                                    "type": metadata.get("e", "Image"),
+                                    "width": source.get("x", 0),
+                                    "height": source.get("y", 0),
+                                }
+                            )
+
+            media_details["gallery_items"] = gallery_items
+
+        # Check for poll content
+        elif hasattr(submission, "poll_data") and submission.poll_data:
+            media_type = "poll"
+            poll_data = submission.poll_data
+
+            media_details["poll"] = {
+                "total_votes": poll_data.get("total_vote_count", 0),
+                "voting_end_timestamp": poll_data.get("voting_end_timestamp", 0),
+                "options": [
+                    {
+                        "text": option.get("text", ""),
+                        "votes": option.get("vote_count"),
+                    }
+                    for option in poll_data.get("options", [])
+                ],
+            }
+
+        # Check for image content
+        elif hasattr(submission, "preview") and submission.preview:
+            media_type = "image"
+            images = []
+
+            # Extract main image
+            preview_images = submission.preview.get("images", [])
+            if preview_images:
+                main_image = preview_images[0]
+                source = main_image.get("source", {})
+                images.append(
+                    {
+                        "url": source.get("url", "").replace("&amp;", "&"),
+                        "width": source.get("width", 0),
+                        "height": source.get("height", 0),
+                        "caption": None,
+                    }
+                )
+
+                # Add resolutions
+                resolutions = main_image.get("resolutions", [])
+                media_details["resolutions"] = [
+                    {
+                        "url": res.get("url", "").replace("&amp;", "&"),
+                        "width": res.get("width", 0),
+                        "height": res.get("height", 0),
+                    }
+                    for res in resolutions
+                ]
+
+            media_details["images"] = images
+
+        # External link
+        elif not submission.is_self:
+            media_type = "link"
+            media_details["external_url"] = submission.url
+            media_details["domain"] = getattr(submission, "domain", "")
+
+        # Add common media fields
+        if hasattr(submission, "thumbnail") and submission.thumbnail not in [
+            "self",
+            "default",
+            "nsfw",
+            "spoiler",
+        ]:
+            media_details["thumbnail"] = submission.thumbnail
+
+        # Extract preview images if available
+        preview_images = []
+        if hasattr(submission, "preview") and submission.preview:
+            for image in submission.preview.get("images", []):
+                source = image.get("source", {})
+                if source.get("url"):
+                    preview_images.append(source["url"].replace("&amp;", "&"))
+        media_details["preview_images"] = preview_images
+
+        # Build the response
+        result = {
+            "id": submission.id,
+            "title": submission.title,
+            "author": str(submission.author) if submission.author else "[deleted]",
+            "subreddit": str(submission.subreddit),
+            "score": submission.score,
+            "upvote_ratio": submission.upvote_ratio,
+            "num_comments": submission.num_comments,
+            "created_utc": submission.created_utc,
+            "url": submission.url,
+            "permalink": f"https://reddit.com{submission.permalink}",
+            "is_self": submission.is_self,
+            "content": submission.selftext
+            if submission.is_self
+            else (submission.title + "\n\n" + submission.url),
+            "media_type": media_type,
+            "media_details": media_details,
+            "over_18": submission.over_18,
+            "spoiler": getattr(submission, "spoiler", False),
+            "stickied": submission.stickied,
+            "locked": submission.locked,
+            "archived": submission.archived,
+            "flair": {
+                "text": getattr(submission, "link_flair_text", None),
+                "css_class": getattr(submission, "link_flair_css_class", None),
+                "background_color": getattr(
+                    submission, "link_flair_background_color", None
+                ),
+                "text_color": getattr(submission, "link_flair_text_color", None),
+            }
+            if getattr(submission, "link_flair_text", None)
+            else None,
+            "awards": [
+                {
+                    "name": award.get("name", ""),
+                    "count": award.get("count", 1),
+                    "description": award.get("description", ""),
+                }
+                for award in getattr(submission, "all_awardings", [])
+            ],
+            "metadata": {
+                "fetched_at": time.time(),
+                "is_original_content": getattr(
+                    submission, "is_original_content", False
+                ),
+                "is_crosspostable": getattr(submission, "is_crosspostable", False),
+                "is_reddit_media_domain": getattr(
+                    submission, "is_reddit_media_domain", False
+                ),
+                "is_robot_indexable": getattr(submission, "is_robot_indexable", True),
+                "send_replies": getattr(submission, "send_replies", True),
+                "contest_mode": getattr(submission, "contest_mode", False),
+                "gilded": getattr(submission, "gilded", 0),
+                "total_awards_received": getattr(
+                    submission, "total_awards_received", 0
+                ),
+                "suggested_sort": getattr(submission, "suggested_sort", None),
+            },
+        }
+
+        return result
+
+    except Exception as e:
+        logger.error(f"Error in get_submission_with_media: {e}")
+        if "404" in str(e) or "not found" in str(e).lower():
+            raise ValueError(f"Submission {submission_id} not found") from e
+        if "403" in str(e) or "forbidden" in str(e).lower():
+            raise ValueError(
+                f"Not authorized to access submission {submission_id}"
+            ) from e
+        if isinstance(e, (ValueError, RuntimeError)):
+            raise
+        raise RuntimeError(f"Failed to fetch submission with media: {e}") from e
+
+
+@track_tool_usage
 @mcp.tool()
 @require_write_access
 def who_am_i() -> Dict[str, Any]:
